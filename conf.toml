@@ -1,0 +1,3 @@
+nthread = 8
+seed = "seed.txt"
+redis = ["localhost:6379", ""]

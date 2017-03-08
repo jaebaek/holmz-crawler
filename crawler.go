@@ -1,12 +1,23 @@
 package main
 
 import (
-	"fmt"
-	"golang.org/x/net/html"
 	"net/http"
-	"os"
+	"bytes"
 	"strings"
+	"sync/atomic"
+
+	// html parser
+	"golang.org/x/net/html"
+
+	// redis client
+	"github.com/garyburd/redigo/redis"
 )
+
+// root url id
+var RUID uint64 = 0
+func getRUID() uint64 {
+	return atomic.AddUint64(&RUID, 1)
+}
 
 // Helper function to pull the href attribute from a Token
 func getHref(t html.Token) (ok bool, href string) {
@@ -24,85 +35,84 @@ func getHref(t html.Token) (ok bool, href string) {
 }
 
 // Extract all http** links from a given webpage
-func crawl(url string, ch chan string, chFinished chan bool) {
+func visit(url string, ruid uint64, c redis.Conn) {
+	// check if already visited
+	if _, err := redis.String(c.Do("HGET", HTML, url)); err == nil {
+		Dbg.V("HGET html %v: %v\n", url, err)
+		return
+	}
+	Dbg.V("visit: %v\n", url)
+
+	// get html page
 	resp, err := http.Get(url)
-
-	defer func() {
-		// Notify that we're done after this function
-		chFinished <- true
-	}()
-
 	if err != nil {
-		fmt.Println("ERROR: Failed to crawl \"" + url + "\"")
+		Dbg.E("ERROR: Failed to crawl \"%v\"\n", url)
+		Dbg.E("ERROR: %v\n", err)
 		return
 	}
 
 	b := resp.Body
-	defer b.Close() // close Body when the function returns
+	defer b.Close()
 
+	// get links
+	var htmlBuf bytes.Buffer
 	z := html.NewTokenizer(b)
-
 	for {
 		tt := z.Next()
+		htmlBuf.Write(z.Raw())
 
 		switch {
 		case tt == html.ErrorToken:
 			// End of the document, we're done
+			page := htmlBuf.String()
+			c.Do("HSET", HTML, url, page)
+			Dbg.V(page)
 			return
 		case tt == html.StartTagToken:
 			t := z.Token()
 
 			// Check if the token is an <a> tag
-			isAnchor := t.Data == "a"
-			if !isAnchor {
+			if t.Data != "a" {
 				continue
 			}
 
 			// Extract the href value, if there is one
-			ok, url := getHref(t)
-			if !ok {
-				continue
-			}
+			if ok, link := getHref(t); ok {
+				if strings.Index(link, "http") != 0 && len(link) != 0 && link[0] != '#' && link != "./" && link != "/" {
 
-			// Make sure the url begines in http**
-			hasProto := strings.Index(url, "http") == 0
-			if hasProto {
-				ch <- url
+					// ruid -- LIST [children ...]
+					if _, err := c.Do("LPUSH", ruid, link); err != nil {
+						Dbg.E("LPUSH error: %v\n", err)
+					}
+				}
 			}
 		}
 	}
 }
 
-func main() {
-	foundUrls := make(map[string]bool)
-	seedUrls := os.Args[1:]
+func run(tid int, done chan int) {
 
-	// Channels
-	chUrls := make(chan string)
-	chFinished := make(chan bool) 
+	// open new connection
+	c := redisPool.Get()
+	defer c.Close()
 
-	// Kick off the crawl process (concurrently)
-	for _, url := range seedUrls {
-		go crawl(url, chUrls, chFinished)
-	}
+	// start from root url
+	for {
+		url, _ := redis.String(c.Do("LPOP", SEED))
+		if url == "" {
+			break
+		}
 
-	// Subscribe to both channels
-	for c := 0; c < len(seedUrls); {
-		select {
-		case url := <-chUrls:
-			foundUrls[url] = true
-		case <-chFinished:
-			c++
+		ruid := getRUID()
+		visit (url, ruid, c)
+		for {
+			child, _ := redis.String(c.Do("LPOP", ruid))
+			if child == "" {
+				break
+			}
+			visit (url + child, ruid, c)
 		}
 	}
-
-	// We're done! Print the results...
-
-	fmt.Println("\nFound", len(foundUrls), "unique urls:\n")
-
-	for url, _ := range foundUrls {
-		fmt.Println(" - " + url)
-	}
-
-	close(chUrls)
+	Dbg.I("Thread #%v done\n", tid)
+	done <- tid
 }
